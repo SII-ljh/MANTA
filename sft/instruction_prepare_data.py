@@ -171,5 +171,5 @@ if __name__ == "__main__":
     print(eval_examples[50])
 
 """
-python instruction_prepare_data.py --work_dir '../experiment/debug/quick'
+python instruction_prepare_data.py --work_dir '<work_dir>'
 """

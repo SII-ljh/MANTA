@@ -1,4 +1,4 @@
-"""End-to-end PACT v5 CPU smoke. Loads real Llama-3.1-8B in fp32 on CPU,
+"""End-to-end MANTA v5 CPU smoke. Loads real Llama-3.1-8B in fp32 on CPU,
 exercises `_forward_k_predictor` with warmup_skip=0 so the per-chunk oracle
 path runs. ~3-5 min on CPU (1.5TB RAM available).
 
@@ -28,12 +28,12 @@ SAC_ADAPTER = os.environ.get(
     "MANTA_SAC_ADAPTER",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "weights", "sac_8b_paper", "output", "adapter.pt"))
-OUT_DIR = "/tmp/pact_v5_cpu_smoke"
+OUT_DIR = "/tmp/manta_v5_cpu_smoke"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
 def build_task_config():
-    """Mirrors experiment/pact_stage2/config.json sft_task_config + matryoshka_training_config."""
+    """Mirrors experiment/manta_stage2/config.json sft_task_config + matryoshka_training_config."""
     return {
         "is_pretrain": False,
         "is_sft": True,

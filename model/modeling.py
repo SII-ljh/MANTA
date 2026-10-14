@@ -13,29 +13,13 @@ from model.lora import LinearLoraLayer
 
 
 def _patch_qwen2_rope_full_cache():
-    """Backbone-integration fix (2026-06-13): make Qwen2's index-gather RoPE
-    tolerate PACT's non-0-indexed position ids.
-
-    PACT's compress()/decoder branches use 1-indexed / kv-offset position ids
-    (e.g. arange(start_idx+1, end_idx+1), or arange(end_idx, ...) over a tiny
-    mem KV cache). Llama's RoPE (transformers >=4.40) computes cos/sin DIRECTLY
-    from the position-id *values* (matmul), so any position value works. Qwen2's
-    older RoPE instead returns cos_cached[:seq_len] and apply_rotary_pos_emb does
-    `cos[position_ids]` — a GATHER that assumes position_ids in [0, seq_len).
-    With PACT's 1-indexed ids the max position == seq_len -> "index out of bounds"
-    (IndexKernel.cu assert / SIGABRT on the very first forward).
-
-    Fix: return the FULL (un-sliced) cos/sin cache from the rotary forward so the
-    gather indexes the full [0, max_seq_len_cached) table. Mathematically identical
-    to Llama's value-based RoPE; cache is grown if a position id exceeds it.
-    No-op for Llama (different rotary signature/class). Idempotent.
-    """
+    """Keep Qwen2 rotary caches indexable by MANTA position ids."""
     try:
         import transformers.models.qwen2.modeling_qwen2 as _q
     except Exception:
         return
     RE = getattr(_q, "Qwen2RotaryEmbedding", None)
-    if RE is None or getattr(RE, "_pact_full_cache_patched", False):
+    if RE is None or getattr(RE, "_manta_full_cache_patched", False):
         return
     # Only old-style cached rotary (forward(x, seq_len) + cos_cached) needs this.
     if not (hasattr(RE, "_set_cos_sin_cache") and hasattr(RE, "forward")):
@@ -47,7 +31,7 @@ def _patch_qwen2_rope_full_cache():
         return (self.cos_cached.to(dtype=x.dtype), self.sin_cached.to(dtype=x.dtype))
 
     RE.forward = _full_cache_forward
-    RE._pact_full_cache_patched = True
+    RE._manta_full_cache_patched = True
 
 
 # Apply at import so every model built in this process (encoder, decoder,
@@ -56,37 +40,7 @@ _patch_qwen2_rope_full_cache()
 
 
 class GatePredictor(nn.Module):
-    """Multi-mode gate predictor.
-
-    gate_mode:
-
-      "cumprod" (v3 default)
-        Monotonic per-anchor gate within chunk:
-            g_i = prod_{j<=i} sigmoid(MLP(h_j))
-        Truncation-only; cross-chunk elastic only via aggregated lm_loss.
-
-      "cross_chunk_softmax" (v4a — ICLR novelty: global budget conservation)
-        Pool each chunk to a score; cross-chunk softmax allocates fixed total
-        budget B_total = N_chunks * target_avg among chunks.
-            s_c    = MLP(mean_pool(anchor_hidden_c))           # [num_chunks, B]
-            α_c    = softmax(s_c, dim=chunks)
-            b_c    = N_chunks * target_avg * α_c               # sum_c b_c = B_total
-            g_{c,i} = sigmoid((b_c - i - 0.5) / tau)           # soft within-chunk gate
-        Chunks COMPETE for fixed global budget — true elastic redistribution.
-        No sparsity loss needed; budget conservation is structural.
-
-      "content_topk" (v4b — ICLR novelty: content-aware anchor selection)
-        Per-anchor score s_i. At training, with matryoshka k sampled, output a
-        differentiable soft top-k mask using Gumbel-Sigmoid + L0 hard concrete:
-            s_i + Gumbel noise → ranked → soft top-k via sigmoid((rank - k) * τ⁻¹)
-        At inference, hard top-k by score. Replaces matryoshka's first-k
-        positional truncation with content-driven selection.
-
-    Returns:
-      g       [B, total_M]
-      info    {"log_h", "h" (per-anchor), "b_chunks" (cross_chunk_softmax),
-               "score" (content_topk), "gate_mode"}
-    """
+    """Predict per-position retention for legacy gate ablations."""
 
     def __init__(self, hidden_size: int, max_mem_size: int = 34,
                  init_bias: float = 5.0, gate_mode: str = "cumprod",
@@ -122,7 +76,7 @@ class GatePredictor(nn.Module):
             N_c = scores.shape[0]
             # 2) cross-chunk softmax → α_c
             alpha = F.softmax(scores, dim=0)                                       # [N_c, B]
-            # 3) per-chunk budget; sum = N_c * target_avg
+            # 3) allocate the target mean across chunks.
             B_total = float(N_c) * self.target_avg
             b_chunks = B_total * alpha                                             # [N_c, B]
             b_chunks = b_chunks.clamp(max=float(self.max_mem_size))
@@ -193,23 +147,7 @@ def sample_topk_mask_gumbel(score: torch.Tensor, k: int,
     return torch.sigmoid((s - threshold) * (1.0 / max(tau, 1e-3)))
 
 
-# ============================================================================
-# PACT v5 — K Predictor (r2, 2026-05-25)
-#
-# Per-chunk integer k prediction with ε-conditioning. Replaces v4a gate which
-# F13 ablation showed not to add F1 on top of Matryoshka. Architecture:
-#   - Per-layer dim reduction (Linear(d_kv, d_layer_low=4)) keeps full 32-layer
-#     KV signal at <1M params (vs 67M for r1 single-linear flatten).
-#   - Monotone survival head: per slot the head emits a "continue" hazard logit
-#     a_i; keep-prob p_i = ∏_{j<=i} sigmoid(a_j) is non-increasing by
-#     construction. Training BCE acts on the SAME monotone p_i used at inference
-#     (no more train/infer mismatch from the old per-slot-BCE + cummin scheme),
-#     so a single noisy intermediate slot can no longer collapse the whole tail.
-# Supervision: per-chunk oracle k = min{k : L(chunk_c at k, others at K_max)
-#                                            − L_full < ε}.
-# ε sampled discretely from {0.01, 0.05, 0.1, 0.2}, matching the evaluation grid.
-# ============================================================================
-
+# Elastic Allocator: epsilon-conditioned per-chunk retention prediction.
 
 K_CHOICES = [1, 2, 4, 8, 16, 34]
 
@@ -274,15 +212,7 @@ def keep_logprob(hazard_logit: torch.Tensor, head_mode: str = "monotone"):
 
 
 class KPredictor(nn.Module):
-    """Predict per-chunk retention via a monotone survival head.
-
-    Input  : anchor KVs across all layers, [B, L=32, 2, total_M, d_kv=4096]
-    forward: list of per-chunk hazard logits a_i, each [B, m_c] (raw, no sigmoid).
-             The keep-prob is p_i = ∏_{j<=i} sigmoid(a_j) — built in
-             `monotone_keep_logprob`, used identically by loss and inference.
-    predict_k: count the prefix with p_i > threshold → integer k per chunk
-             (p_i is already monotone, so no cummin projection is needed).
-    """
+    """Predict per-chunk retention from compressed key/value states."""
 
     def __init__(self,
                  num_layers: int = 32,
@@ -308,34 +238,18 @@ class KPredictor(nn.Module):
         # Keep-prob parameterisation: "monotone" (cumprod survival, default) or
         # "independent" (per-slot sigmoid; A3 ablation). Shared by loss+predict_k.
         self.head_mode = str(head_mode)
-        # --- KV-aware redesign knobs (2026-06-29). All default to the original
-        # behaviour so an unflagged KPredictor is bit-identical to the v4 module.
-        #   feat_mode           : "linear4" (orig) | "kv_headstats" (Idea2)
-        #   use_residual_energy : append per-slot residual-energy channel (Idea1)
-        #   slot_mixer          : "mha" (orig) | "gru" (Idea3)
-        #   eps_mode            : "add" (orig) | "film" (Idea4)
-        #   eps_monotone        : route ε ONLY through a non-negative subtractive
-        #                         term so k is monotone-decreasing in ε by
-        #                         construction (Idea4); overrides eps_mode path.
+        # Optional feature, mixer and epsilon-conditioning variants.
         self.feat_mode = str(feat_mode)
         self.use_residual_energy = bool(use_residual_energy)
         self.slot_mixer = str(slot_mixer)
         self.eps_mode = str(eps_mode)
         self.eps_monotone = bool(eps_monotone)
-        # pos_weight up-weights the "keep" term in the BCE (predictor_loss). With
-        # weighted BCE the per-slot optimum shifts to p* = w·q / (1−q + w·q),
-        # so the oracle boundary q>0.5 maps to p > w/(1+w), NOT p > 0.5. We store
-        # this calibrated threshold and use it as predict_k's default so the
-        # ε→budget calibration stays consistent between train and inference.
-        # pos_weight == 4.0 default (class-balanced for ~5:1 imbalance); 1.0 → threshold 0.5 no-op.
+        # Match the inference threshold to the weighted BCE target.
         self.pos_weight = float(pos_weight)
         self.keep_threshold = self.pos_weight / (1.0 + self.pos_weight)
         # --- Featurization ---
         if self.feat_mode == "kv_headstats":
-            # Idea2: respect (num_kv_heads, head_dim) geometry; K and V get
-            # SEPARATE per-head pooled stats (norm/mean/var over head_dim) — K is
-            # addressing/position, V is content (Table 4d), so they must not share
-            # a projection. Per-layer in-dim = 2 (K,V) * num_kv_heads * 3 stats.
+            # Preserve K/V head geometry with per-head summary statistics.
             assert num_kv_heads and head_dim, "kv_headstats needs num_kv_heads/head_dim"
             assert num_kv_heads * head_dim == d_kv, "num_kv_heads*head_dim must == d_kv"
             self.num_kv_heads = int(num_kv_heads)
@@ -347,8 +261,7 @@ class KPredictor(nn.Module):
             ])
             reduced_dim = num_layers * d_layer_low
         else:
-            # "linear4" (original): one shared Linear(d_kv→d_layer_low) per layer,
-            # applied to both K and V; concat across layers ×2.
+            # Project K and V independently at each layer.
             self.layer_proj = nn.ModuleList([
                 nn.Linear(d_kv, d_layer_low) for _ in range(num_layers)
             ])
@@ -373,40 +286,23 @@ class KPredictor(nn.Module):
         nn.init.normal_(self.pos_emb, std=0.02)
         # Slot mixer over the ordered slots within a chunk.
         if self.slot_mixer == "gru":
-            # Idea3: causal recurrence — each slot's hazard sees a running summary
-            # of the kept prefix, matching the nested/residual-code semantics.
+            # A recurrent mixer preserves prefix order.
             self.slot_gru = nn.GRU(d_hidden, d_hidden, batch_first=True)
         else:
-            # Original: single-layer multi-head self-attention over slots.
+            # Default mixer: one self-attention layer.
             self.attn = nn.MultiheadAttention(d_hidden, num_heads=attn_heads, batch_first=True)
         self.norm = nn.LayerNorm(d_hidden)
-        # Per-slot MLP head → raw "continue" hazard logit a_i.
-        # Small-std weight + LARGE POSITIVE bias on the last layer: at init each
-        # hazard logit ≈ +bias, so sigmoid(a_i) ≈ 1 and the cumulative keep-prob
-        # p_i = ∏ sigmoid(a_j) stays high across all slots → predict_k starts
-        # near max_slots ("keep everything, let training prune"). This is the
-        # right prior for the survival head and avoids the early collapse to
-        # tiny k seen with zero-bias init (where p_i = 0.5^i decays instantly).
-        # Small-std (not zero) weight keeps grad flowing upstream from step 1.
+        # Positive initialization starts allocation near the full prefix.
         self.head = nn.Sequential(
             nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, 1),
         )
         nn.init.normal_(self.head[-1].weight, std=1e-3)
-        # bias=4.0 → sigmoid≈0.982 → p_{34}≈0.982^34≈0.54 > 0.5: all slots kept
-        # at init, so initial k ≈ max_slots for every chunk.
         nn.init.constant_(self.head[-1].bias, 4.0)
 
     def _reduce_kv(self, anchor_kv):
-        """anchor_kv: [B, L, 2, total_M, d_kv] (any dtype)
-           → [B, total_M, reduced_dim] in float32 (predictor is fp32 internally).
-
-        feat_mode="linear4"      → reduced_dim = L*2*d_layer_low (original)
-        feat_mode="kv_headstats" → reduced_dim = L*d_layer_low; each layer feeds
-            per-head (norm/mean/var over head_dim) for K and V separately into a
-            Linear, so the (num_kv_heads, head_dim) geometry is preserved instead
-            of being flattened away."""
+        """Reduce layerwise key/value states to allocator features."""
         anchor_kv = anchor_kv.float()
         B, L, KV, total_M, d_kv = anchor_kv.shape
         if self.feat_mode == "kv_headstats":
@@ -437,18 +333,7 @@ class KPredictor(nn.Module):
 
     @staticmethod
     def _residual_energy(anchor_kv_chunk):
-        """Per-slot residual / marginal-utility curve for ONE chunk's anchors.
-
-        anchor_kv_chunk: [B, L, 2, m_c, d_kv] raw KV slice for the chunk.
-        Returns: [B, m_c, 1] in [0, 1] — r_i = ‖A_i − P_{<i}A_i‖² / ‖A_i‖², the
-        fraction of slot i's energy NOT already spanned by the kept prefix. This
-        mirrors the oracle's marginal-loss definition (slot i is worth keeping iff
-        it adds energy the prefix lacks) and is a pure detached data statistic
-        (scale-robust, no learned params) → good OOD behaviour.
-
-        Modified Gram–Schmidt over the flattened per-slot vectors; m_c ≤ 34 and
-        B is typically 1, so the double loop is negligible vs the decoder passes.
-        """
+        """Return a detached residual-energy feature for each position."""
         x = anchor_kv_chunk.detach().float()                    # [B, L, 2, m_c, d_kv]
         B, L, KV, m_c, d_kv = x.shape
         v = x.permute(0, 3, 1, 2, 4).reshape(B, m_c, L * KV * d_kv)  # [B, m_c, D]
@@ -468,13 +353,7 @@ class KPredictor(nn.Module):
         return out
 
     def forward(self, anchor_kv, per_chunk_mem_sizes, epsilon):
-        """anchor_kv: [B, L, 2, total_M, d_kv]
-        per_chunk_mem_sizes: list[int] per-chunk slot counts
-        epsilon: scalar or [B] tensor
-        Returns: list of [B, m_c] raw hazard logits a_i (no sigmoid, no cumprod).
-                 The monotone keep-prob p_i is derived downstream by both the
-                 loss and predict_k via `monotone_keep_logprob`.
-        """
+        """Return per-chunk hazard logits conditioned on epsilon."""
         B = anchor_kv.shape[0]
         x_red = self._reduce_kv(anchor_kv)                      # [B, total_M, reduced_dim] (fp32)
 
@@ -555,13 +434,13 @@ class KPredictor(nn.Module):
 
     def predict_k_naive(self, anchor_kv, per_chunk_mem_sizes, global_budget,
                         k_choices, min_k: int = 1):
-        """Naive-Gate inference: score all slots, spend ONE global fixed budget
+        """Naive-Gate inference: score all slots, spend one global allocation
         greedily top-k, snap per-chunk counts to the K_set ladder.
 
         Score = monotone keep-prob p_i (same head as the eps path), but with a
         NEUTRAL epsilon (0.0) so the eps-conditioning embedding contributes a
         constant offset and the allocation is driven purely by content scores +
-        the fixed global budget. No per-chunk eps tolerance.
+        the fixed allocation. No per-chunk eps tolerance.
         """
         B = anchor_kv.shape[0]
         eps0 = torch.zeros(B, device=anchor_kv.device, dtype=torch.float32)
@@ -592,9 +471,7 @@ def extract_full_kv(encoder_past_key_values):
 
 
 def _build_keep_indices(per_chunk_mem_sizes, k_per_chunk, device):
-    """Build a flat index tensor selecting the first k_c anchors per chunk
-    from a concatenated [total_M] axis.
-    """
+    """Build flat indices for the first k_c Matryoshka tokens in each chunk."""
     keep_idx_parts = []
     offset = 0
     for m, k in zip(per_chunk_mem_sizes, k_per_chunk):
@@ -605,10 +482,7 @@ def _build_keep_indices(per_chunk_mem_sizes, k_per_chunk, device):
 
 
 def truncate_kv_to_k(encoder_past_key_values, k, per_chunk_mem_sizes):
-    """Truncate per-chunk anchors. `k` can be scalar (applies to all chunks)
-    or list[int] (per-chunk).
-    Returns tuple of (K, V) tensors with total kept dim across chunks.
-    """
+    """Keep the first k Matryoshka tokens in each chunk."""
     if isinstance(k, int):
         k_per_chunk = [k] * len(per_chunk_mem_sizes)
     else:
@@ -624,9 +498,7 @@ def truncate_kv_to_k(encoder_past_key_values, k, per_chunk_mem_sizes):
 
 def truncate_single_chunk_kv(encoder_past_key_values, per_chunk_mem_sizes,
                               target_chunk: int, k: int):
-    """Truncate ONLY `target_chunk` to first k anchors; other chunks kept whole.
-    Used for per-chunk oracle measurement.
-    """
+    """Truncate one chunk for oracle measurement; keep the others unchanged."""
     k_per_chunk = list(per_chunk_mem_sizes)
     k_per_chunk[target_chunk] = min(int(k), int(per_chunk_mem_sizes[target_chunk]))
     return truncate_kv_to_k(encoder_past_key_values, k_per_chunk, per_chunk_mem_sizes)
@@ -634,34 +506,8 @@ def truncate_single_chunk_kv(encoder_past_key_values, per_chunk_mem_sizes,
 
 def naive_global_topk_k_per_chunk(scores_per_chunk, per_chunk_mem_sizes,
                                   global_budget, k_choices, min_k: int = 1):
-    """Naive-Gate allocation rule (ablation variant, gate_mode="naive").
+    """Distribute a requested mean allocation across chunks."""
 
-    Unlike the eps-Gate (per-chunk learned budget with an epsilon tolerance),
-    the naive gate scores every anchor slot and spends a SINGLE GLOBAL FIXED
-    budget greedily top-k across all chunks, then snaps each chunk's raw count
-    to the nearest k in the K_set ladder.
-
-    Concretely:
-      B_total = round(global_budget * N_chunks)          # total slots to keep
-      rank all slots (across chunks) by score desc, keep the top B_total
-      raw_k_c = #(kept slots in chunk c)                  # >=0, <= m_c
-      k_c = snap raw_k_c to the NEAREST k in k_choices (tie -> larger),
-            clamped to [min_k, m_c]; 0 -> min_k.
-    Nearest-snapping keeps the realized mean_k tracking global_budget with
-    small near-unbiased error (snap-UP would over-spend +1..+3); snapping to the
-    ladder keeps the kept-set on the same {1,2,4,8,16,32} grid the matryoshka
-    backbone was trained on (so the naive truncation reuses the front-loaded
-    anchors exactly like the eps path).
-
-    scores_per_chunk: list len N_chunks of [B, m_c] float score tensors
-                      (higher = more important; here = monotone keep-prob p_i).
-    per_chunk_mem_sizes: list[int] m_c per chunk.
-    global_budget: float, target mean slots-per-chunk (e.g. 7.37 for ~64x).
-    k_choices: sorted K_set ladder, e.g. [1,2,4,8,16,32].
-    Returns:
-      ks: list[list[int]] outer len N_chunks, inner len B.
-      ks_b0: list[int] first-batch view (one int per chunk), use when B==1.
-    """
     N = len(per_chunk_mem_sizes)
     B = scores_per_chunk[0].shape[0]
     device = scores_per_chunk[0].device
@@ -671,7 +517,7 @@ def naive_global_topk_k_per_chunk(scores_per_chunk, per_chunk_mem_sizes,
 
     def snap_near(raw, m):
         # Snap raw count to the NEAREST ladder rung (tie -> larger). Nearest
-        # (vs snap-up) keeps realized mean_k tracking global_budget with small,
+        # (vs snap-up) keeps realized mean_k tracking the requested allocation with small,
         # near-unbiased error (~|0.8| over the ladder), which is what the T8
         # "mean compression matched to T1" requirement needs; snap-up would
         # systematically over-spend by +1 to +3.
@@ -768,7 +614,7 @@ def _within_sample_rank_loss(pred_k, oracle_k, mode="corr"):
     """Within-sample (across-chunk) ranking loss between the predictor's
     continuous expected-k and the oracle k. pred_k, oracle_k: [N_chunks] for one
     batch element. Scale/mean-INVARIANT, so it optimises the per-chunk RELATIVE
-    allocation (the elastic-budget ordering) without touching mean-k — the
+    allocation (the elastic allocation ordering) without touching mean-k — the
     complement to the pointwise BCE, which only fixes calibration.
 
     mode="corr"     : 1 − Pearson(pred_k, oracle_k)            (listwise)
@@ -815,7 +661,7 @@ def predictor_loss(logit_list, per_chunk_mem_sizes, oracle_per_chunk,
     rank_weight: weight on an added WITHIN-SAMPLE (across-chunk) ranking loss
         (default 0.0 == original pointwise BCE only). The pointwise BCE has no
         cross-chunk term, so with detached features it collapses toward the per-ε
-        mean-k and loses per-chunk discrimination (F101/F102). The ranking loss
+        mean-k and loses per-chunk discrimination (the earlier pointwise loss). The ranking loss
         directly optimises the relative per-chunk allocation (within-sample
         Spearman) and is mean/scale-invariant, so it complements the BCE.
     rank_mode: "corr" (1−Pearson, listwise) | "pairwise" (margin over pairs).
@@ -847,8 +693,6 @@ class CompressLLM(torch.nn.Module):
         super().__init__()
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        # CPU debugging support: pass device_rank="cpu" to load on CPU in fp32
-        # (bf16 on CPU is slow/unreliable on x86).
         is_cpu = (str(device_rank) == "cpu")
         device_map = "cpu" if is_cpu else f"cuda:{device_rank}"
         dtype = torch.float32 if is_cpu else torch.bfloat16
@@ -863,8 +707,7 @@ class CompressLLM(torch.nn.Module):
             device_map=device_map,
         )
         freeze_decoder(self.decoder)
-        # Optional gradient checkpointing on the encoder (saves ~30-40% peak
-        # activation memory; ~20% slowdown). Decoder is frozen, so no need.
+        # Gradient checkpointing is disabled because compression reads the KV cache.
         if bool(task_config.get("gradient_checkpointing", False)):
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -908,12 +751,9 @@ class CompressLLM(torch.nn.Module):
         # Gumbel temperature for content_topk; annealed externally via task_config.
         self._gumbel_tau = float(task_config.get("gumbel_tau", 1.0))
 
-        # PACT v5 K-Predictor (r2). Not mutually exclusive with gate, but typically
-        # use_gate=False when use_k_predictor=True (gate has been ablation-falsified).
+        # Elastic Allocator options.
         self.use_k_predictor = bool(task_config.get("use_k_predictor", False))
-        # PACT naive-Gate ablation: "epsilon" (default eps-tolerance learned
-        # per-chunk budget) vs "naive" (per-chunk score head + ONE global
-        # fixed-budget top-k allocation, no eps tolerance). T8 ablation.
+        # Optional fixed-allocation ablation.
         self.predictor_gate_mode = str(task_config.get("predictor_gate_mode", "epsilon"))
         self.naive_global_budget = task_config.get("naive_global_budget", None)
         if self.use_k_predictor:
@@ -921,7 +761,7 @@ class CompressLLM(torch.nn.Module):
             num_kv_heads = getattr(mcfg, "num_key_value_heads", mcfg.num_attention_heads)
             head_dim = mcfg.hidden_size // mcfg.num_attention_heads
             d_kv = num_kv_heads * head_dim
-            # KV-aware redesign presets (2026-06-29): predictor_arch is a
+            # KV-aware redesign presets: predictor_arch is a
             # convenience that expands to the composable flags below; explicit
             # flags still override. "kv_marginal" = Idea1+Idea2 (recommended).
             _arch = str(task_config.get("predictor_arch", "default"))
@@ -955,7 +795,7 @@ class CompressLLM(torch.nn.Module):
             ).to(self.device)   # fp32 (small ~1M params)
         else:
             self.k_predictor = None
-        # Trainer sets this each step for warmup gating.
+        # The trainer updates this each step for warmup gating.
         self._global_step = 0
 
     def _sample_matryoshka_k(self):
@@ -966,7 +806,7 @@ class CompressLLM(torch.nn.Module):
         return random.choices(ks, weights=weights, k=1)[0]
 
     def forward(self,inputs):
-        # PACT v5: dispatch to dedicated branch when KPredictor is active.
+        # Use the allocator branch when enabled.
         if self.use_k_predictor:
             return self._forward_k_predictor(inputs)
 
@@ -974,15 +814,12 @@ class CompressLLM(torch.nn.Module):
         tot_task = 0
         loss_info = {}
 
-        # Matryoshka: sample per-chunk truncation k per step (training only).
+        # Sample the per-chunk Matryoshka allocation during training.
         truncate_k = self._sample_matryoshka_k()
         if truncate_k is not None:
             loss_info["matryoshka_k"] = truncate_k
 
-        # For content_topk gate: keep ALL anchors in compress; gate's top-k mask
-        # (driven by matryoshka_k) controls how many survive — content-aware,
-        # not positional. For other modes, compress() does first-k truncation
-        # (matryoshka's positional front-loading prior).
+        # Content-top-k uses the learned score; other modes use the prefix.
         use_content_topk = (self.use_gate and self.gate_mode == "content_topk")
         compress_truncate_k = None if use_content_topk else truncate_k
 
@@ -1146,7 +983,7 @@ class CompressLLM(torch.nn.Module):
         loss = tot_loss / tot_task
 
         # Optional sparsity loss. cross_chunk_softmax does NOT need it
-        # (budget is structurally constrained by softmax). content_topk also
+        # (allocation is constrained by softmax). content_topk also
         # does not need it (k controlled by matryoshka). Cumprod path keeps
         # backward compat — no extra loss by default.
         sparsity_weight = float(self.task_config.get("sparsity_weight", 0.0))
@@ -1186,22 +1023,11 @@ class CompressLLM(torch.nn.Module):
         return torch.arange(start, end, step=ratio, device=self.device).unsqueeze(0)
 
     def compress(self, inputs, truncate_k=None, truncate_k_per_chunk=None):
-        """Compress context tokens into per-chunk anchor KV cache.
+        """Encode context into a compressed representation.
 
-        truncate_k: int | list[int] | None
-            - int: same k applied to all chunks (legacy Matryoshka behavior).
-            - list[int]: per-chunk k (PACT v5; e.g. KPredictor.predict_k output).
-            - None: keep all anchors.
-        truncate_k_per_chunk: explicit list form (preferred over scalar when both set).
-
-        Returns:
-            compress_token_ids: [1, total_M] anchor position ids (after truncation)
-            compress_token:     [B, total_M, D] embedding-layer hidden at anchor positions
-            end_idx:            position id after last context token (unchanged by k)
-            mem_last_hidden:    [B, total_M, D] LAST-layer hidden at anchor positions (for gate)
-            encoder_past_key_values: tuple of (K, V) per layer, mem-dim = total_M
-            encoder_mem_size:   total_M = sum(per_chunk_mem_sizes)
-            per_chunk_mem_sizes: list[int] kept anchors per chunk (post-truncation)
+        `truncate_k` applies one Matryoshka-token count to every chunk; a list
+        selects a count per chunk. The return value includes the compressed KV
+        cache and its per-chunk sizes.
         """
         bsz, total_length = inputs['input_ids'].size()
         num_chunks = self.compute_num_chunks(total_length)
@@ -1299,7 +1125,7 @@ class CompressLLM(torch.nn.Module):
                 per_chunk_mem_sizes)
 
     # ========================================================================
-    # PACT v5 — Stage 2/3 training branch (use_k_predictor=True)
+    # MANTA v5 — Stage 2/3 training branch (use_k_predictor=True)
     # ========================================================================
 
     def _decoder_lm_loss_for_pkv(self, inputs, past_key_values, end_idx,
@@ -1353,7 +1179,7 @@ class CompressLLM(torch.nn.Module):
         )
 
     def _forward_k_predictor(self, inputs):
-        """PACT v5 Stage 2/3 forward: matryoshka backbone + (warmup-gated)
+        """MANTA v5 Stage 2/3 forward: matryoshka backbone + (warmup-gated)
         per-chunk oracle + KPredictor BCE."""
         loss_info = {}
 
@@ -1440,13 +1266,13 @@ class CompressLLM(torch.nn.Module):
             epsilon = eps_grid[eps_idx]                          # [B]
         loss_info["eps_mean"] = float(epsilon.mean().cpu())
 
-        # 4-naive) PACT naive-Gate ablation (predictor_gate_mode == "naive"):
+        # 4-naive) MANTA naive-Gate ablation (predictor_gate_mode == "naive"):
         # no eps tolerance. eps is pinned to 0 (neutral); the per-chunk TARGET k
-        # is the GLOBAL fixed-budget top-k allocation of the predictor's own
+        # is the GLOBAL fixed-allocation top-k allocation of the predictor's own
         # current scores (snapped to K_set). The survival head is then trained
         # (same weighted-BCE / per-slot survival labels as the eps path) to
-        # reproduce that global-budget allocation. Single-variable vs eps path:
-        # only the oracle/target differs (global-fixed-budget vs per-chunk eps).
+        # reproduce that global allocation. Single-variable vs eps path:
+        # only the oracle/target differs (global-fixed allocation vs per-chunk eps).
         if self.predictor_gate_mode == "naive":
             global_budget = float(self.task_config.get("naive_global_budget", 8.0))
             epsilon = torch.zeros(B, device=device, dtype=torch.float32)
@@ -1493,7 +1319,7 @@ class CompressLLM(torch.nn.Module):
         #     a self-correcting signal: aggressive other-chunk predictions push
         #     L_ck[k] up, raising the oracle for the target chunk.
         assert B == 1, (
-            "PACT v5 KPredictor oracle path assumes batch_size_per_device=1; "
+            "MANTA v5 KPredictor oracle path assumes batch_size_per_device=1; "
             f"got B={B}"
         )
         anchor_kv = extract_full_kv(encoder_past_key_values_full).detach()
@@ -1507,7 +1333,7 @@ class CompressLLM(torch.nn.Module):
         # Oracle other-chunk context. "selfref" (default, current behaviour):
         # other chunks held at their own predicted k -> self-referential moving
         # target. "kmax": other chunks held at K_max -> stationary oracle target
-        # decoupled from the predictor's own output. Diagnostic lever 2026-06-13.
+        # Use a stationary full-allocation reference when requested.
         oracle_ctx = str(self.task_config.get("oracle_context_mode", "selfref"))
         base_k_list = list(k_pred_b0) if oracle_ctx == "selfref" else [K_max] * N_chunks
         loss_info["oracle_ctx_kmax"] = (oracle_ctx != "selfref")
@@ -1577,7 +1403,7 @@ class CompressLLM(torch.nn.Module):
         trained KPredictor to pick per-chunk k. Otherwise fall back to v3/v4
         gate/positional behavior.
         """
-        # PACT v5 inference branch (KPredictor active + epsilon given).
+        # MANTA v5 inference branch (KPredictor active + epsilon given).
         use_v5_predictor = (
             self.use_k_predictor
             and self.k_predictor is not None
@@ -1605,7 +1431,7 @@ class CompressLLM(torch.nn.Module):
                 anchor_kv = extract_full_kv(encoder_past_key_values)
                 if self.predictor_gate_mode == "naive":
                     # Naive-Gate: ignore epsilon; allocate one global fixed
-                    # budget. `epsilon` arg is repurposed as the global budget
+                    # allocation. `epsilon` arg is repurposed as the global allocation
                     # ONLY if naive_global_budget is unset (eval override hook).
                     gb = self.naive_global_budget
                     if gb is None:
@@ -1707,19 +1533,7 @@ class CompressLLM(torch.nn.Module):
 
     def lm_inference_diag(self, inputs, generate_num=128, strategy="gate_soft",
                           target_n_per_chunk=None, seed=42):
-        """Diagnostic inference supporting multiple keep-strategies on stage3 model.
-
-        strategy in:
-          - 'all34'       : no gate, keep all anchors (baseline at full budget)
-          - 'gate_soft'   : multiply pkv by trained gate g (no hard drop)
-          - 'gate_hard'   : keep top-N anchors per chunk by g (hard select)
-          - 'first'       : keep first N anchors per chunk (positional baseline)
-          - 'random'      : keep random N anchors per chunk (seed=seed + sample_hash)
-          - 'uniform'     : multiply all pkv by (N / M_chunk), soft uniform attenuation
-
-        target_n_per_chunk : int. Required for gate_hard/first/random/uniform.
-        Returns: (generated_token_ids, info_dict). info contains gate stats.
-        """
+        """Run diagnostic generation with fixed, gated, or adaptive allocation."""
         (compress_token_ids, compress_token, end_idx,
          mem_last_hidden, encoder_past_key_values, encoder_mem_size,
          per_chunk_mem_sizes) = self.compress(inputs, truncate_k=None)
@@ -1838,7 +1652,7 @@ class CompressLLM(torch.nn.Module):
             compress_token_ids = compress_token_ids.index_select(1, keep_idx)
 
         elif strategy == "k_predictor":
-            # PACT v5: use trained KPredictor to pick per-chunk k.
+            # MANTA v5: use trained KPredictor to pick per-chunk k.
             # target_n_per_chunk repurposed as epsilon (must be in eps_grid).
             assert self.use_k_predictor and self.k_predictor is not None, (
                 "k_predictor strategy requires use_k_predictor=True"
@@ -2034,7 +1848,7 @@ def freeze_encoder(model):
             continue
         if name.startswith("gate_predictor."):
             continue
-        # PACT v5: KPredictor must remain trainable.
+        # MANTA v5: KPredictor must remain trainable.
         if name.startswith("k_predictor."):
             continue
         param.requires_grad = False

@@ -1,12 +1,8 @@
-"""K-sweep evaluation for Matryoshka SAC.
+"""K-sweep evaluation for MANTA.
 
 For each sample in a (possibly subsampled) eval set, generate answers at each
 k in K_VALUES and compute token-F1 / EM against reference answers. Splits samples
 across visible GPUs (mp.spawn). Saves per-rank per-k JSON + aggregate summary.
-
-Compares with SAC baseline at k=34 (or full-mem) by either:
-  - re-evaluating baseline on the same subset (set --baseline_adapter)
-  - or referencing existing qa_eval_all_results.json with matching ids
 """
 import argparse
 import json
@@ -29,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model.modeling import get_model, load_adapter
 
 
-# ---- metrics (copied from scripts/eval_qa.py) ----
+# ---- SQuAD-normalized metrics ----
 def normalize_answer(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"\b(a|an|the)\b", " ", s)
@@ -79,7 +75,7 @@ def parse_args():
     p.add_argument("--adapter_name", type=str, default="instruction_adapter.pt")
     p.add_argument("--output_name", type=str, default="k_sweep_results")
     p.add_argument("--gate_threshold", type=float, default=None,
-                   help="If set, pass to lm_inference. Use 0.0 to disable gate soft-multiply (keeps all anchors without applying gate). None = default behavior (soft gate).")
+                   help="If set, pass to lm_inference. Use 0.0 to disable gate soft-multiply (keeps all compressed tokens without applying the gate). None = default behavior (soft gate).")
     return p.parse_args()
 
 

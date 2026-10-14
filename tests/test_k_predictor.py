@@ -1,4 +1,4 @@
-"""Unit tests for PACT v5 K Predictor (r2).
+"""Unit tests for MANTA v5 K Predictor (r2).
 
 Tests the new KPredictor + per-chunk oracle + utility functions in isolation.
 Uses small dims (d_kv=64, num_layers=4) so all tests run on CPU in <30s.
@@ -305,7 +305,7 @@ def test_kpredictor_forward_returns_logit_list():
 def test_kpredictor_keep_everything_init():
     """r2 init: head last-layer has small-std weight + bias=+4 so every slot's
     'continue' logit ≈ +4 at init → high cumulative keep-prob → predict_k starts
-    near max_slots ('keep everything, let training prune'). (Updated 2026-06-29:
+    near max_slots ('keep everything, let training prune'). (Updated:
     the old near-zero-logit expectation predated the bias=4.0 survival prior.)"""
     p = _make_predictor()
     anchor_kv = torch.randn(1, NUM_LAYERS, 2, MAX_SLOTS, D_KV)
@@ -415,7 +415,7 @@ def test_predictor_loss_zero_when_logits_match_targets():
 def test_predictor_loss_weighted_monotone_survival():
     """predictor_loss is the weighted BCE on the MONOTONE keep-prob p_i (survival
     head), NOT a plain per-slot bce_with_logits. Confirm against the same
-    monotone_keep_logprob the head/predict_k use. (Updated 2026-06-29: the old
+    monotone_keep_logprob the head/predict_k use. (Updated: the old
     plain-BCE expectation predated the survival-head + pos_weight redesign.)"""
     from model.modeling import monotone_keep_logprob
     logit = torch.tensor([[1.0, -1.0]])
@@ -444,7 +444,7 @@ def test_k_choices_sorted_ascending():
 
 
 # =====================================================================
-# KV-aware redesign variants (2026-06-29): Idea1 residual-energy,
+# KV-aware redesign variants: Idea1 residual-energy,
 # Idea2 kv-headstats, Idea3 gru mixer, Idea4 eps-FiLM / eps-monotone.
 # =====================================================================
 
@@ -569,8 +569,8 @@ def test_default_unflagged_matches_original_path():
 
 
 # =====================================================================
-# Within-sample ranking loss (2026-06-30): objective fix for the
-# pointwise-BCE mean-k collapse (F101/F102).
+# Within-sample ranking loss: objective fix for the
+# pointwise-BCE mean-k collapse (/).
 # =====================================================================
 
 def test_rank_loss_corr_perfect_and_anti():

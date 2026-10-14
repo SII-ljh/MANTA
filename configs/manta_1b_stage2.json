@@ -1,5 +1,5 @@
 {
-  "_note": "MANTA Stage 2 (instruction tuning on MRQA). Initialized from the Stage-1 checkpoint; learning rate halved, allocator warmup skip 0 (the allocator is already trained) with a shorter ramp.",
+  "_note": "MANTA Stage 2: MRQA instruction tuning from the Stage-1 checkpoint. The decoder stays frozen, the encoder uses rank-128 LoRA on q_proj/v_proj, and the Elastic Allocator is trained with the all-k objective.",
   "pretrain_training_config": {
     "model_id": "meta-llama/Llama-3.2-1B",
     "chunk_size": 512,
@@ -7,7 +7,7 @@
     "batch_size_per_device": 1,
     "device_count": 8,
     "gradient_accumulation_steps": 2,
-    "learning_rate": 1e-05,
+    "learning_rate": 5e-05,
     "max_grad_norm": 2.0,
     "log_step": 100,
     "valid_step": 100000000,
@@ -34,7 +34,7 @@
     "batch_size_per_device": 1,
     "device_count": 8,
     "gradient_accumulation_steps": 2,
-    "learning_rate": 1e-05,
+    "learning_rate": 5e-05,
     "max_grad_norm": 2.0,
     "log_step": 100,
     "valid_step": 100000000,
@@ -83,7 +83,7 @@
     "total_steps": 20000,
     "init_adapter_path": "SCRATCH",
     "data_mode": "sft",
-    "full_finetune": true,
+    "full_finetune": false,
     "ckpt_step_offset": 0
   },
   "data_config": {

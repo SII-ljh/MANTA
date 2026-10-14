@@ -2,7 +2,7 @@ MANTA
 Copyright 2026 The MANTA Authors
 
 This product includes software developed for the paper "MANTA: Adaptive Context
-Compression via Matryoshka Anchors and Tolerance-Conditioned Allocation".
+Compression via Matryoshka Tokens and Tolerance-Conditioned Allocation".
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -11,21 +11,10 @@ Third-party code, models and data
 --------------------------------------------------------------------------------
 
 Derived code
-  The training and evaluation harness (pretrain/, sft/, util/, model/) descends
-  from the public implementation of SAC (Autoencoding-Free Context Compression
-  for LLMs via Contextual Semantic Anchors), which is also one of the baselines
-  in this paper. The Matryoshka anchor representation, the elastic allocator,
-  the tolerance-conditioned objective and the oracle labeling are additions made
-  here.
-
-Baseline reimplementations
-  baselines/icae/  and baselines/c500x/ are our own implementations of the ICAE
-  and 500xCompressor training and evaluation harnesses, written against
-  transformers and peft. They contain no code copied from the upstream projects.
-  Refer to the upstream repositories for the original implementations:
-    ICAE            — In-context Autoencoder for Context Compression
-    500xCompressor  — Generalized Prompt Compression for LLMs
-  LongLLMLingua is used through the published `llmlingua` package.
+  The training and evaluation harness descends from the public SAC implementation
+  (Autoencoding-Free Context Compression for LLMs via Contextual Semantic Anchors).
+  Matryoshka tokens, the Elastic Allocator, the tolerance-conditioned objective,
+  and oracle labeling are additions made here.
 
 Backbones
   Llama 3.1 / Llama 3.2 models are subject to the Meta Llama community license.
@@ -40,6 +29,6 @@ Datasets
   carries its own terms.
 
 Libraries
-  PyTorch, Hugging Face transformers / tokenizers / datasets / accelerate / peft,
-  NumPy, Matplotlib and the other packages pinned in requirements.txt are used
-  under their own licenses.
+  PyTorch, Hugging Face transformers / tokenizers / datasets / accelerate,
+  NumPy and the other packages pinned in requirements.txt are used under their
+  own licenses.

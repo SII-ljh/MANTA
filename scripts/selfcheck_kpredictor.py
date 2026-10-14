@@ -141,7 +141,7 @@ print(f"k histogram over random heads: {dict(sorted(collections.Counter(rng_ks).
 
 # ----------------------------------------------------------------------------
 print("\n=== ckpt arch compatibility (load k_predictor.* from trained adapter) ===")
-CKPT = "experiment/pact_v5_mrqa/output/instruction_adapter.pt"
+CKPT = "experiment/manta_v5_mrqa/output/instruction_adapter.pt"
 ckpt_path = os.path.join(PROJECT_ROOT, CKPT)
 if os.path.exists(ckpt_path):
     sd = torch.load(ckpt_path, map_location="cpu")

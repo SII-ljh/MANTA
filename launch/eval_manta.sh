@@ -13,7 +13,7 @@
 #
 # Usage
 #   EXP_DIR=experiment/manta_1b_stage2 \
-#   EVAL_PT=sft/output/mrqa_eval_Llama-3.2-1B_320000samples_instruction.pt \
+#   EVAL_PT=data/mrqa_eval_full/qa_eval.pt \
 #   EVAL_META=data/mrqa_eval_full/qa_eval_meta.json \
 #   bash launch/eval_manta.sh
 #
@@ -162,4 +162,3 @@ done
 echo "[eval] done"
 echo "[eval]   fixed-k : $REPORT_DIR/tokenf1_${TAG}_ksweep.json"
 echo "[eval]   adaptive: $REPORT_DIR/tokenf1_${TAG}_adaptive.json"
-echo "[eval] macro IID/OOD splits: python scripts/compare_subset_fullft.py"

@@ -14,11 +14,6 @@ numpy==1.26.4
 pandas==2.2.2
 pyarrow==19.0.1
 tqdm==4.66.4
-matplotlib==3.9.1
-nltk==3.8.1
 wandb==0.17.5
 
-# Optional, not needed for training or evaluating MANTA itself:
-#   peft        — baselines/icae, baselines/c500x (LoRA harnesses)
-#   llmlingua   — scripts/eval_longllmlingua.py
-#   pytest      — tests/
+# pytest is needed only for the CPU test suite.

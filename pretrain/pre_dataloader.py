@@ -1,9 +1,7 @@
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import torch
 
-# Llama-3 / Llama-3.2 pad token id. Both Llama-3.1-8B and Llama-3.2-1B use 128004
-# (verified in their config.json `pad_token_id`). Hardcoded here because the
-# dataloader doesn't receive the tokenizer.
+# Llama-3 pad token id; the dataloader does not receive the tokenizer.
 LLAMA3_PAD_ID = 128004
 LABEL_IGNORE = -100  # CrossEntropyLoss(ignore_index=-100) skips these positions
 
@@ -19,34 +17,13 @@ def _pad_to_length(t: torch.Tensor, length: int, pad_value: int) -> torch.Tensor
 
 
 class CompressDataset(IterableDataset):
-    """Yields padded batches for SAC/PACT pretrain.
-
-    Patched 2026-06-01 to support batch_size > 1:
-      * length-sorts examples by `inputs` size (descending) so each yielded
-        batch has near-uniform length and padding overhead stays small
-      * right-pads every tensor to its batch max length with pad_token_id
-        (NOT -100). The model uses lm_targets/ae_targets as BOTH the decoder
-        teacher-forcing input (`embed_tokens(lm_targets[:,:-1])`) AND the CE
-        label. Padding with -100 crashes embedding lookup with a device-side
-        assert (vocab index OOB). pad_token_id is a valid token id; the CE
-        loss will count pad positions, but length-sorting keeps pad ratio
-        small (typically <5% within a batch), so the noise is negligible.
-    """
+    """Yield padded pretraining batches."""
 
     def __init__(self, examples, batch_size):
         super(CompressDataset).__init__()
-        # Sort once at init by input length so within-batch padding is minimal.
-        # Descending so the first batch carries the longest sample (memory
-        # peak hits early — fail-fast on OOM instead of crashing mid-epoch).
-        # bs==1 (every real training run) preserves input order so the example
-        # stream is identical to MAIN (allk_k34up). Only bs>1 sorts by length to
-        # minimise within-batch padding. Sorting at bs==1 was the 2026-06-01
-        # regression that pushed the WSD decay phase onto the shortest sequences.
+        # Preserve order for single-sample training; sort larger batches.
         if batch_size > 1:
-            print("[WARN] batch_size_per_device > 1: GLOBAL descending length-sort"
-                  " of the training stream is active (known -12 F1 WSD-decay"
-                  " curriculum regression, see F64/F32). Use bs=1 + grad-accum"
-                  " for any run whose numbers will be compared.", flush=True)
+            print("[WARN] batch_size_per_device > 1: sorting by length", flush=True)
         self.examples = examples if batch_size == 1 else sorted(
             examples, key=lambda e: e["inputs"].size(0), reverse=True)
         self.batch_size = batch_size
@@ -61,7 +38,7 @@ class CompressDataset(IterableDataset):
             if len(bucket_in) == bs:
                 yield self._make_batch(bucket_in, bucket_ae, bucket_lm)
                 bucket_in, bucket_ae, bucket_lm = [], [], []
-        # drop trailing partial batch (matches original behaviour)
+        # Drop a trailing partial batch.
 
     @staticmethod
     def _make_batch(bucket_in, bucket_ae, bucket_lm):

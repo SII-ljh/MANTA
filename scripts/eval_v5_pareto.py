@@ -1,4 +1,4 @@
-"""PACT v5 — Pareto evaluator (KPredictor + ε), with optional oracle upper bound.
+"""MANTA v5 — Pareto evaluator (KPredictor + ε), with optional oracle upper bound.
 
 For each eval sample, run compress() ONCE then loop ε ∈ EPS_LIST:
   • KPredictor branch: call predict_k(epsilon) → truncate KV → generate
@@ -22,7 +22,10 @@ from collections import Counter, defaultdict
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-mp.set_sharing_strategy("file_descriptor")
+try:
+    mp.set_sharing_strategy("file_descriptor")
+except (RuntimeError, AssertionError):
+    mp.set_sharing_strategy("file_system")
 from tqdm import tqdm
 from transformers import AutoTokenizer
 

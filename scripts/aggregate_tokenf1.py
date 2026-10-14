@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Aggregate SQuAD-normalized token-F1 (second metric, unified standard v2 2026-06-11)
-from eval rank*.json files into a compact report.
+"""Aggregate token-F1/EM reports from per-rank evaluator output.
 
-Per key (k or eps setting): per-dataset mean -> IID/OOD macro (mirrors SAC-aligned
-ROUGE protocol) + overall sample mean. IID = 6 MRQA in-domain datasets (prefix match).
-
-Usage:
-  python scripts/aggregate_tokenf1.py --sources "LABEL=GLOB" [--out OUT.json]
+Scores are averaged per dataset, then macro-averaged over the IID and OOD
+splits. Each input sample must contain `f1`, `em`, and `dataset` fields.
 """
 import argparse, glob, json, statistics as st
 from collections import defaultdict
@@ -35,17 +31,11 @@ def main():
                 if not isinstance(samples, list):
                     continue
                 for s in samples:
-                    # FAIL LOUD on missing f1/em (2026-06-13, F64): bridge rank
-                    # files (ICAE/c500x) carry only `generated` -- silently
-                    # defaulting to 0.0 produced plausible-looking all-zero
-                    # token-F1 reports. Use scripts/rescore_tokenf1_from_generated.py
-                    # for those files instead.
+                    # Require scored records; missing fields indicate a bad run.
                     if "f1" not in s or "em" not in s:
                         raise KeyError(
                             f"{f}: sample id={s.get('id','?')} has no 'f1'/'em' "
-                            f"field. This rank file was not produced by "
-                            f"eval_k_sweep.py; rescore it with "
-                            f"scripts/rescore_tokenf1_from_generated.py.")
+                            f"field. Check the evaluator output.")
                     per_key[key][s["dataset"]].append(s["f1"])
                     per_key_em[key][s["dataset"]].append(s["em"])
                     for ek in ("mean_k", "mean_compression"):

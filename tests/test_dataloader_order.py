@@ -1,11 +1,11 @@
-"""Regression test for the 2026-06-01 dataloader length-sort bug.
+"""Regression test for the dataloader length-sort bug.
 
-MAIN (allk_k34up) was trained 2026-05-30/31 with the OLD dataloaders that fed
-examples in their original (seed-0 shuffled, mixed-length) order. On 2026-06-01
+MAIN (allk_k34up) was trained/31 with the OLD dataloaders that fed
+examples in their original (seed-0 shuffled, mixed-length) order. On
 both dataloaders were patched to length-sort the whole shard descending to
 support batch_size>1. At the bs_per_device=1 used by every real run this sort
 is the SOLE behavioural change vs MAIN, and it makes the WSD low-LR decay phase
-train only on the shortest sequences -> ~6pt/stage F1 regression.
+train only on the shortest sequences -> ~6pt/stage  regression.
 
 Fix: at batch_size==1 the dataloader MUST preserve input order (no sort), so
 the training example stream is identical to MAIN. batch_size>1 keeps sorting.

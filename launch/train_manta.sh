@@ -2,10 +2,8 @@
 # ---------------------------------------------------------------------------
 # Two-stage MANTA training: Stage 1 (raw long text) -> Stage 2 (MRQA SFT).
 #
-# This is the main-line recipe of the paper: the encoder is fully fine-tuned,
-# the decoder LLM stays frozen, the Matryoshka objective covers all k per step,
-# and the tolerance is sampled from a grid so one model spans the whole
-# compression range.
+# Main two-stage recipe: LoRA-adapted encoder, frozen decoder, all-k
+# Matryoshka objective and tolerance-conditioned allocation.
 #
 # Usage
 #   bash launch/train_manta.sh                        # full run, all visible GPUs
@@ -24,6 +22,7 @@
 #                         ablations); quoting is honoured, so a JSON value with
 #                         spaces must be quoted: --set ...eps_grid='[0.05, 0.1]'
 #   PORT_BASE     torch.distributed rendezvous port   [15200]
+#   S1_LR/S2_LR   learning rates for the two stages [1e-4 / 5e-5]
 #   WANDB_MODE    online|offline|disabled             [offline]
 #
 # Each stage is idempotent: it is skipped once done, and a stage interrupted
@@ -42,6 +41,8 @@ S1_EXTRA="${S1_EXTRA:-}"
 S2_EXTRA="${S2_EXTRA:-}"
 PORT_BASE="${PORT_BASE:-15200}"
 WANDB_MODE="${WANDB_MODE:-offline}"
+S1_LR="${S1_LR:-1e-4}"
+S2_LR="${S2_LR:-5e-5}"
 DRYRUN="${DRYRUN:-0}"
 
 if [ "$DRYRUN" = "1" ]; then
@@ -53,7 +54,7 @@ else
 fi
 
 # S1_DIR/S2_DIR can be set explicitly to reproduce the directory names the
-# paper's aggregation scripts expect (docs/REPRODUCE.md lists the mapping).
+# evaluation scripts and reports expect.
 S1_DIR="${S1_DIR:-$EXP_ROOT/${EXP_TAG}_stage1}"
 S2_DIR="${S2_DIR:-$EXP_ROOT/${EXP_TAG}_stage2}"
 mkdir -p "$LOG_DIR" "$S1_DIR/output" "$S2_DIR/output"
@@ -78,9 +79,9 @@ newest_step() {  # highest step-tagged checkpoint in a work_dir, or empty
     | sed -E 's/.*_step([0-9]+)\.pt/\1/' | sort -n | tail -1
 }
 
-run_stage() {  # name dir template init_default data_mode port log [extra args...]
-  local name=$1 dir=$2 template=$3 init_default=$4 mode=$5 port=$6 log=$7
-  shift 7
+run_stage() {  # name dir template init mode port log lr [extra args...]
+  local name=$1 dir=$2 template=$3 init_default=$4 mode=$5 port=$6 log=$7 lr=$8
+  shift 8
   local extra=("$@")
 
   if [ -f "$dir/.STAGE_DONE" ]; then
@@ -109,7 +110,7 @@ run_stage() {  # name dir template init_default data_mode port log [extra args..
     --template "$template" --work_dir "$dir" \
     --model_id "$MODEL_ID" --device_count "$NGPU" \
     --total_steps "$remaining" --init "$init" \
-    --save_step "$SAVE_STEP" --ckpt_step_offset "$offset" \
+    --save_step "$SAVE_STEP" --ckpt_step_offset "$offset" --lr "$lr" \
     ${extra[@]+"${extra[@]}"} \
     || { echo "[train] $name: config rendering failed"; exit 1; }
 
@@ -149,13 +150,13 @@ eval "S1_ARGS=($S1_EXTRA)" || { echo "[train] cannot parse S1_EXTRA"; exit 1; }
 eval "S2_ARGS=($S2_EXTRA)" || { echo "[train] cannot parse S2_EXTRA"; exit 1; }
 
 run_stage stage1 "$S1_DIR" "$S1_CONFIG" SCRATCH pretrain \
-  "$PORT_BASE" "$LOG_DIR/${EXP_TAG}_stage1.log" ${S1_ARGS[@]+"${S1_ARGS[@]}"}
+  "$PORT_BASE" "$LOG_DIR/${EXP_TAG}_stage1.log" "$S1_LR" ${S1_ARGS[@]+"${S1_ARGS[@]}"}
 
 S1_CKPT="$S1_DIR/output/instruction_adapter.pt"
 [ -f "$S1_CKPT" ] || { echo "[train] missing Stage-1 checkpoint $S1_CKPT"; exit 1; }
 
 run_stage stage2 "$S2_DIR" "$S2_CONFIG" "$S1_CKPT" sft \
-  "$((PORT_BASE + 1))" "$LOG_DIR/${EXP_TAG}_stage2.log" ${S2_ARGS[@]+"${S2_ARGS[@]}"}
+  "$((PORT_BASE + 1))" "$LOG_DIR/${EXP_TAG}_stage2.log" "$S2_LR" ${S2_ARGS[@]+"${S2_ARGS[@]}"}
 
 echo "[train] all done"
 echo "[train]   stage 1: $S1_CKPT"

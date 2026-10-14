@@ -1,26 +1,4 @@
-"""Matryoshka SFT trainer.
-
-Three-stage training for SAC + Matryoshka anchor truncation + monotonic gate:
-  stage 1: Matryoshka only      (use_matryoshka=True, use_gate=False)
-  stage 2: Matryoshka + gate    (use_gate=True, lambda_budget=0, entropy_weight=0)
-  stage 3: + budget + entropy   (lambda_budget ramps 0→λ_max, entropy 0→ε_max)
-
-Stage and ramp schedule are read from config["matryoshka_training_config"]:
-  {
-    "stage": 1 | 2 | 3,
-    "total_steps": int,
-    "init_adapter_path": str,
-    "lambda_budget_max": float,
-    "entropy_weight_max": float,
-    "ramp_steps": int                 # over how many steps to ramp (stage 3)
-  }
-
-WandB metrics added on top of base trainer:
-  - matryoshka/k_sampled        (per-step)
-  - per-k running lm_loss       (rolling, by sampled k)
-  - gate/mean_h, gate/E_sum_g, gate/N_kept   (when use_gate)
-  - loss/budget_loss, loss/entropy           (when active)
-"""
+"""Two-stage trainer for MANTA compression and Elastic Allocator training."""
 import argparse
 import json
 import logging
@@ -54,7 +32,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.FileHandler('log.txt', mode='w'), logging.StreamHandler()],
 )
-_BASE_SEED = int(os.environ.get("PACT_BASE_SEED", "12345"))
+_BASE_SEED = int(os.environ.get("MANTA_BASE_SEED", "12345"))
 torch.manual_seed(_BASE_SEED)
 np.random.seed(_BASE_SEED)
 random.seed(_BASE_SEED)
@@ -74,7 +52,7 @@ def parse_args():
     p.add_argument('--work_dir', required=True)
     p.add_argument('--port', default='14527')
     p.add_argument('--wandb_mode', default='disabled', choices=['online', 'offline', 'disabled'])
-    p.add_argument('--wandb_project', default='sac-matryoshka')
+    p.add_argument('--wandb_project', default='manta')
     p.add_argument('--wandb_run_name', default=None)
     p.add_argument('--data_mode', required=True, choices=['sft', 'pretrain'],
                    help='sft: instruction QA (Stage 3). pretrain: raw text PG-19 (Stage 2 in v5 plan B). '
@@ -121,8 +99,7 @@ def train(rank, args, world_size):
     _reseed_for_rank(rank)
 
     matryoshka_config = config["matryoshka_training_config"]
-    # data_mode=pretrain → read pretrain_* config sections (raw text PG-19);
-    # data_mode=sft → read sft_* sections (variable-length QA).
+    # Select the config and data loader for the requested stage.
     if args.data_mode == 'pretrain':
         training_config = config["pretrain_training_config"]
         task_config = config["pretrain_task_config"]
@@ -130,9 +107,7 @@ def train(rank, args, world_size):
         training_config = config["sft_training_config"]
         task_config = config["sft_task_config"]
     config["data_config"]["model_id"] = training_config["model_id"]
-    # data_config kwargs differ between pretrain/sft get_examples signatures.
     if args.data_mode == 'pretrain':
-        # pretrain get_examples needs output_dir (where the precomputed .pt sits)
         config["data_config"].setdefault(
             "output_dir", os.path.join(_PROJECT_ROOT, "pretrain", "output")
         )
@@ -141,7 +116,6 @@ def train(rank, args, world_size):
         config["data_config"].pop("output_dir", None)
     get_examples, get_dataset = import_data_modules(args.data_mode)
 
-    # Inject Matryoshka task flags (overridable per stage).
     task_config["use_matryoshka"] = matryoshka_config.get("use_matryoshka", True)
     task_config["matryoshka_ks"] = matryoshka_config.get(
         "matryoshka_ks", [2, 4, 8, 16, 32, task_config["mem_size"]]
@@ -151,26 +125,22 @@ def train(rank, args, world_size):
     )
     task_config["use_gate"] = matryoshka_config.get("use_gate", False)
     task_config["gate_init_bias"] = matryoshka_config.get("gate_init_bias", 5.0)
-    # v4 fields (default values preserve v3 cumprod behavior).
     task_config["gate_mode"] = matryoshka_config.get("gate_mode", "cumprod")
     task_config["sparsity_weight"] = matryoshka_config.get("sparsity_weight", 0.0)
     task_config["target_avg"] = matryoshka_config.get("target_avg", 12.0)
     task_config["elastic_tau"] = matryoshka_config.get("elastic_tau", 1.0)
     task_config["gumbel_tau"] = matryoshka_config.get("gumbel_tau", 1.0)
-    # Budget / entropy are set per-step below via the ramp schedule.
+    # Allocation and entropy weights are updated each step.
     task_config["lambda_budget"] = 0.0
     task_config["entropy_weight"] = 0.0
     task_config["n_target"] = matryoshka_config.get("n_target", 12.0)
 
-    # PACT v5 K-Predictor knobs (forwarded into task_config so model picks them up).
+    # Forward allocator settings to the model.
     task_config["use_k_predictor"] = matryoshka_config.get("use_k_predictor", False)
     task_config["k_choices"] = matryoshka_config.get("k_choices", [1, 2, 4, 8, 16, 34])
     task_config["eps_grid"] = matryoshka_config.get("eps_grid", [0.01, 0.05, 0.1, 0.2])
     task_config["predictor_warmup_skip"] = matryoshka_config.get("predictor_warmup_skip", 5000)
     task_config["alpha_max"] = matryoshka_config.get("alpha_max", 1.0)
-    # Note: matryoshka_config["ramp_steps"] is the legacy gate/budget ramp; the
-    # KPredictor uses its own ramp_steps key (forwarded if present, else falls
-    # back to matryoshka_config["ramp_steps"]).
     task_config["ramp_steps"] = matryoshka_config.get(
         "predictor_ramp_steps", matryoshka_config.get("ramp_steps", 5000)
     )
@@ -181,45 +151,22 @@ def train(rank, args, world_size):
     task_config["predictor_pos_weight"] = matryoshka_config.get("predictor_pos_weight", 4.0)
     task_config["predictor_lr"] = matryoshka_config.get("predictor_lr", None)
     task_config["oracle_context_mode"] = matryoshka_config.get("oracle_context_mode", "selfref")
-    # KPredictor keep-prob parameterisation (A3 ablation): "monotone" (cumprod
-    # survival, default == main) or "independent" (per-slot sigmoid).
     task_config["predictor_head_mode"] = matryoshka_config.get("predictor_head_mode", "monotone")
-    # All-k matryoshka loss + fixed-ε ablation knobs (default off -> behaviour
-    # identical to the sampled main run).
     task_config["matryoshka_all_k"] = matryoshka_config.get("matryoshka_all_k", False)
     task_config["predictor_fixed_eps"] = matryoshka_config.get("predictor_fixed_eps", None)
     task_config["oracle_relative_eps"] = matryoshka_config.get("oracle_relative_eps", False)
     task_config["oracle_eps_floor"] = matryoshka_config.get("oracle_eps_floor", 1e-3)
-    # PACT naive-Gate ablation (T8): "epsilon" default vs "naive" (global
-    # fixed-budget top-k, no eps tolerance) + the matched global budget.
     task_config["predictor_gate_mode"] = matryoshka_config.get("predictor_gate_mode", "epsilon")
     task_config["naive_global_budget"] = matryoshka_config.get("naive_global_budget", None)
-    # KV-aware predictor redesign (2026-06-29). predictor_arch is a preset that
-    # expands to the composable flags below ("default" | "kv_marginal"); explicit
-    # flags override. All default to the original v4 behaviour.
     task_config["predictor_arch"] = matryoshka_config.get("predictor_arch", "default")
     task_config["predictor_feat_mode"] = matryoshka_config.get("predictor_feat_mode", None)
     task_config["predictor_use_residual_energy"] = matryoshka_config.get("predictor_use_residual_energy", None)
     task_config["predictor_slot_mixer"] = matryoshka_config.get("predictor_slot_mixer", "mha")
     task_config["predictor_eps_mode"] = matryoshka_config.get("predictor_eps_mode", "add")
     task_config["predictor_eps_monotone"] = matryoshka_config.get("predictor_eps_monotone", False)
-    # Predictor-only training (frozen v4 encoder): freeze every non-predictor
-    # param via LR=0 (NOT requires_grad=False, so save_adapter still writes a
-    # self-contained adapter = v4 encoder + freshly-trained predictor). The
-    # predictor is loaded fresh (its keys are excluded from the init adapter).
     task_config["train_predictor_only"] = matryoshka_config.get("train_predictor_only", False)
-    # Within-sample (across-chunk) ranking loss on the predictor (2026-06-30).
-    # default 0.0 == original pointwise BCE only. >0 adds a mean/scale-invariant
-    # ranking term that directly optimises per-chunk RELATIVE allocation (the
-    # within-sample Spearman that collapses under pointwise BCE — F101/F102).
     task_config["predictor_rank_loss_weight"] = matryoshka_config.get("predictor_rank_loss_weight", 0.0)
     task_config["predictor_rank_loss_mode"] = matryoshka_config.get("predictor_rank_loss_mode", "corr")
-    # Full fine-tuning variant (no LoRA): train the whole encoder base directly.
-    # Default False -> LoRA behaviour unchanged. The model stays bf16 for the
-    # forward/backward (activations bf16, fits like the LoRA run), but the
-    # optimizer keeps fp32 MASTER copies of the trainable params (see below) so
-    # the small full-FT updates (lr~1e-5) don't underflow bf16 — the standard
-    # bf16-compute + fp32-master mixed-precision recipe (matches HF Trainer).
     task_config["full_finetune"] = matryoshka_config.get("full_finetune", False)
 
     stage = int(matryoshka_config["stage"])
@@ -276,15 +223,7 @@ def train(rank, args, world_size):
     dataset = get_dataset(task_config["task_type"], train_examples, training_config['batch_size_per_device'])
     loader = DataLoader(dataset, batch_size=None)
 
-    # Optional separate LR for the KPredictor params (diagnostic lever
-    # 2026-06-13). When matryoshka_config["predictor_lr"] is set, the predictor
-    # gets its own param group at that LR while the rest of the model keeps
-    # training_config["learning_rate"]. Default (None) -> single group, no-op.
-    #
-    # train_predictor_only (2026-06-29): freeze every non-predictor param by
-    # pinning its LR to 0 (keeps requires_grad=True so save_adapter still writes
-    # the v4 encoder into a self-contained adapter). The predictor trains at
-    # predictor_lr (or the base LR if unset). This is the screen's frozen-v4 path.
+    # Optionally give the allocator its own learning rate.
     _pred_lr = matryoshka_config.get("predictor_lr", None)
     _predictor_only = bool(task_config.get("train_predictor_only", False))
     _full_ft = bool(task_config.get("full_finetune", False))
@@ -419,7 +358,7 @@ def train(rank, args, world_size):
         live_task_cfg = ddp_model.module.task_config
         live_task_cfg["lambda_budget"] = _apply_ramp(global_step, ramp_steps, lambda_budget_max)
         live_task_cfg["entropy_weight"] = _apply_ramp(global_step, ramp_steps, entropy_weight_max)
-        # PACT v5: push step counter to the model so it can gate predictor warmup.
+        # Pass the global step to the allocator.
         ddp_model.module._global_step = step_offset + global_step
 
         if optimizer_step:
@@ -428,7 +367,7 @@ def train(rank, args, world_size):
             with ddp_model.no_sync():
                 loss_info = training_step(ddp_model, inputs, rank, accumulation_steps)
 
-        # Track per-k loss. For PACT v5 KPredictor branch the per-sample matryoshka
+        # Track per-k loss. For MANTA v5 KPredictor branch the per-sample matryoshka
         # loss is "m_loss"; legacy LM path uses "lm_loss". Either may be present.
         k_sampled = loss_info.get("matryoshka_k")
         m_loss_val = loss_info.get("m_loss", loss_info.get("lm_loss"))
@@ -460,7 +399,7 @@ def train(rank, args, world_size):
             for key in ("gate_mean_h", "gate_E_sum_g", "gate_N_kept"):
                 if key in loss_info:
                     log_dict[key] = loss_info[key]
-            # PACT v5 KPredictor metrics
+            # Allocator metrics.
             for key in (
                 "m_loss", "p_loss", "alpha", "warmup_phase",
                 "eps_mean", "L_full_mean",

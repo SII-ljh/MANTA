@@ -107,6 +107,6 @@ if __name__ == "__main__":
 
 """
 cd pretrain
-python pre_prepare_data.py --work_dir '../experiment/debug/quick'
+python pre_prepare_data.py --work_dir '<work_dir>'
 
 """
